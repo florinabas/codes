@@ -1,0 +1,982 @@
+---
+title: "Flufftail Analysis on the Gribben et. al dataset"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+date: "2026"
+---
+
+
+
+```{r message=FALSE, warning=FALSE}
+# library(reticulate)
+# Sys.setenv(OMP_NUM_THREADS = "1")
+# Sys.setenv(OPENBLAS_NUM_THREADS = "1")
+# 
+# use_condaenv(
+#   "arboreto_fix",
+#   conda = "C:/Users/Floarea/miniconda3/Scripts/conda.exe",
+#   required = TRUE
+# )
+# 
+# py_config()  # verify it shows python 3.10 and numpy 1.26.x before continuing
+# 
+# algo      <- import("arboreto.algo")
+# pd        <- import("pandas")
+# grnboost2 <- algo$grnboost2
+```
+
+
+
+```{r message=FALSE, warning=FALSE}
+library(Flufftail)
+library(Seurat)
+library(SeuratWrappers)
+library(monocle3)
+library(ClustAssess)
+library(dplyr)
+library(gprofiler2)
+library(ggplot2)
+library(ggrepel)
+library(SeuratDisk)
+library(anndataR)
+set.seed(42)
+
+```
+
+
+Prepare seurat object for Python reading
+Let’s begin by loading a pre-processed Seurat object, which is ready for clustering
+ (the adjacency matrix has already been computed using Seurat’s FindNeighbors) and visualise the cell types/annotations.
+ 
+```{r load_object, cache=FALSE}
+
+# full <- readRDS("C:/Users/Floarea/Desktop/corebioinfo/codes/data_processing/input_data/GSE202379_SeuratObject_AllCells.rds")
+
+# meta <- full@meta.data %>%
+#   mutate(Disease.status = factor(Disease.status, levels = disease_order))
+
+# # Hepatocyte/Cholangiocyte composition within each disease
+# meta %>%
+#   filter(cell.annotation %in% c("Hepatocytes", "Cholangiocytes")) %>%
+#   count(Disease.status, cell.annotation) %>%
+#   group_by(Disease.status) %>%
+#   mutate(percent = round(100 * n / sum(n), 2))
+
+# # Disease composition of entire dataset
+# meta %>%
+#   count(Disease.status) %>%
+#   mutate(percent = round(100 * n / sum(n), 2))
+
+
+#DefaultAssay(full)
+#dim(full[["RNA"]]) #31257 99809
+#dim(full[["SCT"]]) #30117 99809
+
+# # keep only the cells we're interested in
+# cells_keep <- colnames(full)[
+#     full$cell.annotation %in% c("Hepatocytes", "Cholangiocytes") &
+#     full$Disease.status == "end stage"]
+# 
+#  #length(cells_keep) #25527
+# seurat_object <- subset(full,cells = cells_keep)
+# 
+# rm(full)
+
+ 
+ # sce <- as.SingleCellExperiment(seurat_object)
+ # write_h5ad(sce, "C:/Users/Floarea/Desktop/corebioinfo/codes/flufftail/input_data/GSE202379_filtered.h5ad")
+
+
+# # Plot the UMAP reduction to visualize cell annotations
+#DimPlot(seurat_object, reduction="umap_harmony_t.0", group.by = "cell.annotation")
+
+```
+
+
+# Let's remove the bottom island to focus on the population with the hepatocyte-cholangocyte bridge.
+```{r remove_island}
+# # Remove bottom island - all below -6 on UMAP_2
+# umap_df <- as.data.frame(seurat_object@reductions$umap_harmony_t.0@cell.embeddings)
+# colnames(umap_df) <- c("UMAP_1", "UMAP_2")
+# #cell_names_keep <- rownames(umap_df[umap_df$UMAP_2 > -6,]) #original
+# cell_names_keep <- rownames(umap_df[umap_df$UMAP_1 > 4 & umap_df$UMAP_2 > -10, ])
+# seurat_object <- subset(seurat_object, cells = cell_names_keep)
+# DimPlot(seurat_object, reduction="umap_harmony_t.0", group.by = "cell.annotation")
+
+
+# 3. FIX: Strip corrupted SCTModel slots
+# This is required to bypass the 'containsOutOfMemoryData' error
+# if ("SCT" %in% names(seurat_object@assays)) {
+#     message("Cleaning SCTModel slots to prevent saving errors...")
+#     seurat_object[["SCT"]]@SCTModel.list <- list()
+# }
+
+# 4. Define save path
+#input_dir <- "C:/Users/Floarea/Desktop/corebioinfo/codes/data_processing/input_data"
+#rds_output <- file.path(input_dir, "hep_chol_endstate_truncated.rds")
+
+# 5. Save the object
+#message("Saving object to: ", rds_output)
+#saveRDS(seurat_object, file = rds_output, compress = TRUE)
+
+
+
+```
+
+
+```{r keep only protein coding genes}
+
+# # ── 1. Load Required Libraries ───────────────────────────────────────────────
+# 
+# library(org.Hs.eg.db)
+# library(scCustomize) # Used for robust, seamless .h5ad export
+# 
+# # ── 2. Load the Master Seurat Object ──────────────────────────────────────────
+# input_dir   <- "C:/Users/Floarea/Desktop/corebioinfo/codes/data_processing/input_data"
+# seurat_path <- file.path(input_dir, "hep_chol_endstate_truncated.rds")
+# seurat_object <- readRDS(seurat_path)
+# 
+# #seurat_object <- readRDS(seurat_path)
+# print(paste("Original Dataset:", nrow(seurat_object), "genes ×", ncol(seurat_object), "cells"))
+# 
+# # ── 3. Identify Protein-Coding Genes ──────────────────────────────────────────
+# all_genes <- rownames(seurat_object)
+# 
+# # Query the database for gene types
+# gene_mapping <- select(org.Hs.eg.db,
+#                        keys = all_genes,
+#                        columns = c("SYMBOL", "GENETYPE"),
+#                        keytype = "SYMBOL")
+# 
+# # Extract only genes explicitly flagged as "protein-coding"
+# protein_coding_genes <- gene_mapping$SYMBOL[gene_mapping$GENETYPE == "protein-coding"]
+# protein_coding_genes <- protein_coding_genes[!is.na(protein_coding_genes)]
+# 
+# # ── 4. Filter the Seurat Object ───────────────────────────────────────────────
+# full_protein_coding <- subset(seurat_object, features = protein_coding_genes)
+# print(paste("Filtered Dataset:", nrow(full_protein_coding), "genes ×", ncol(full_protein_coding), "cells"))
+# 
+# # ── 5. OUTPUT 1: Save as R Data Structure (.rds) ──────────────────────────────
+# rds_output <- file.path(input_dir, "hep_chol_endstate_truncated_protein_coding.rds")
+# saveRDS(full_protein_coding, file = rds_output)
+# print(paste("📂 [1/2] R-ready file saved to:", rds_output))
+# 
+# # ── 6. OUTPUT 2: Save as Python Data Structure (.h5ad) ────────────────────────
+# # scCustomize handles the conversion of internal metadata (obs) and counts (X)
+# # smoothly without breaking sparse matrix indexing.
+# print("Converting and writing .h5ad file for Python...")
+# as.anndata(
+#   x = full_protein_coding,
+#   file_path = input_dir,
+#   file_name = "hep_chol_endstate_truncated_protein_coding.h5ad",
+#   assay = "RNA" # Speeds up export by saving your standard raw/log count matrices
+# )
+
+
+
+```
+
+```{r fuzzy_clustassess_analysis}
+# ── 1. Load Required Libraries ───────────────────────────────────────────────
+# library(Seurat)
+# library(ClustAssess)
+# library(Matrix)
+# library(ClustAssess)
+
+# Ensure the data has been normalized before checking stability
+# If you already normalized it, you can skip this step.
+# if (IsMatrixEmpty(GetAssayData(seurat_obj, assay = "RNA", layer = "data"))) {
+#     print("Data not normalized. Running log-normalization...")
+#     seurat_obj <- NormalizeData(seurat_obj, normalization.method = "LogNormalize", scale.factor = 10000)
+# }
+
+# ── 3. Extract the Matrix for ClustAssess ────────────────────────────────────
+# # ClustAssess requires a standard matrix or sparse matrix object (Genes x Cells)
+# log_counts_matrix <- GetAssayData(seurat_obj, assay = "RNA", layer = "data")
+
+# # 1. Prepare your data and define the range of HVG counts to test
+# hvg_steps <- c(500, 1000, 1500, 2000, 3000)
+# 
+# 
+# # This removes any hidden Seurat/S4 attributes from the names
+# colnames(log_counts_matrix) <- as.character(colnames(log_counts_matrix))
+# 
+# # 3. Create a clean feature set based on the matrix we just created
+# all_possible_genes <- colnames(log_counts_matrix)
+# 
+# # 4. Now run the function
+# # We use the 'do.call' method to avoid environment scope issues
+# stability_results <- do.call(assess_feature_stability, list(
+#     data_matrix = log_counts_matrix,
+#     feature_set = all_possible_genes,
+#     steps = c(500, 1000, 1500, 2000),
+#     feature_type = "pca", # 'pca' is more robust than 'hvg' for dense matrices
+#     resolution = 0.5,
+#     n_repetitions = 5
+# ))
+
+
+```
+
+
+
+# Fuzzy clustering
+We will conduct fuzzy clustering on this object by running the Louvain algorithm 50 times with different random seeds, across a range of resolution values (0.01, 0.05, 0.1, 0.15, 0.2).
+
+```{r fuzzy_clustering_analysis}
+#seurat_object <- LoadSeuratRds(file = "C:/Users/Floarea/Desktop/corebioinfo/codes/flufftail/input_data/seurat_object.rds")
+
+# ── 2. Load the Filtered Seurat Object ────────────────────────────────────────
+rds_path <- "C:/Users/Floarea/Desktop/corebioinfo/codes/data_processing/input_data/hep_chol_endstate_truncated_protein_coding.rds"
+seurat_object <- readRDS(rds_path)
+
+# # Get sample names
+sample_names <- colnames(seurat_object)
+
+# Extract adjacency matrix (SNN) from Seurat object
+adj_matrix <- seurat_object@graphs$SCT_snn
+
+# Run fuzzy clustering analysis
+fuzzy_clust_analysis <- Flufftail::fuzzy_clustering_analysis(
+    adj_matrix,
+    sample_names = sample_names,
+    n_repetitions = 30,
+    algorithm = 1,
+   resolution = c(0.01, 0.05, 0.1, 0.15, 0.2)
+  )
+
+# Visualise configurations, sorted by their ECC median.
+plot_ecc_boxplots(fuzzy_clust_analysis$ecc_list, 5, select_highest = T)
+
+```
+
+Gribben et al. [1] aimed to characterize the bridge between cholangiocytes and hepatocytes and identify biphenotypic cells (i.e., fuzzy cells) 
+which were found at the transition between the two cell types (for a reminder of the cell types UMAP refer to Figure in the previous section). 
+In our fuzzy clustering analysis, three resolutions resulted in two clusters (0.01, 0.05, 0.1). We will select the 0.01, following the Keep-it-Simple principle.
+Let's visualise the ECC and hard clusters (selected using marjority voting) across the samples for this clustering configuration.
+
+```{r umap_ecc_hard_clusters}
+# Plot UMAP on ECC and hard clusters
+umap <- seurat_object@reductions$umap_harmony_t.0@cell.embeddings
+
+#previously Louvain_0.01_2 - but empty for my sample
+#chosen_config <- "Louvain_0.01_6" #similar to original tutorial
+chosen_config <- "Louvain_0.05_7" #shows delimitation between hepatocyte celss
+ecc <- fuzzy_clust_analysis$ecc_list[[chosen_config]]
+hard_clusters <- fuzzy_clust_analysis$hard_clusters_list[[chosen_config]]
+
+theme_large_text <- theme(
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 15),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 15)
+  )
+
+
+plot_umap(umap, ecc, "ECC", "ECC")
+
+plot_umap(umap, hard_clusters, "hard clusters", "Hard Clusters")
+
+
+```
+
+We can see that using fuzzy clustering and the ECC evaluation metric we identified fuzzy cells at the transition between the two hard clusters (in line with Gribben et. al definition of biphenotypic cells). The membership degrees across all the cells can also be examined by checking the degree_matrices_list of the selected configuration.
+
+```{r membership_degrees_k2}
+# Check membership degree matrix for Louvain res=0.01 and k=2
+###head(fuzzy_clust_analysis$degree_matrices_list[[chosen_config]])
+
+
+## see most fuzzy cells
+deg_mat <- fuzzy_clust_analysis$degree_matrices_list[[chosen_config]]
+
+fuzzy_cells <- deg_mat %>%
+  filter(
+    if_any(
+      -Cell,
+      ~ . >= 0.4 & . <= 0.6
+    )
+  )
+
+head(fuzzy_cells)
+```
+
+## Consensus matrix
+
+Let's also check the consensus matrix using the `get_consensus_matrix` function. The resulting matrix can be visualized using the `subsample_consensus_mat_plot` function, which randomly subsamples the matrix to a specified number of cells (n_sample). This subsampling is necessary due to the computational intensity of visualizing the entire matrix in a heatmap.
+
+```{r consensus_mat}
+# Get consensus matrix
+consensus <- get_consensus_matrix(fuzzy_clust_analysis$membership_lists[[chosen_config]], sample_names)
+
+# Subsample and visualise - 2000 cells
+consensus_plot <- subsample_consensus_mat_plot(consensus, n_sample = 2000)
+consensus_plot$plot
+
+```
+
+The consensus shows that at resolution 0.01 with k = 2, clustering is highly stable, showing near-uniform blue on the diagonal indicating strong consensus and clear delineation between the two groups - samples reliably co-cluster with each other.
+
+Despite the lack of instability we can apply Shannon's entropy function on the consensus matrix to identify any fuzzy cells. The rows (or columns, due to their symmetry) of the consensus matrix are treated as relative frequency distributions, where each entry $p_{ij}$ indicates the proportion of times cell $i$ clusters with cell $j$ across multiple clustering iterations. Shannon's entopy is defined as:
+
+$$
+H(p_i) = -/sum_{j} p_{ij} /log(p_{ij})
+$$
+
+where /( p/_{ij} /) represents the frequency that cell /( i /) co-clusters with cell /( j /). Cells exhibiting high entropy indicate higher instability, reflecting significant inconsistency in their co-clustering behaviour. Extremely fuzzy cells would result in the highest entropy as they have co-clustering probabilities between 0.25 and 0.5 with most other cells, signalling inconsistent co-clustering behaviour.
+
+```{r entropy_consensus}
+# Calculate and visualise entropy on the consensus matrix.
+
+#entropy_consensus <- calculate_entropy(consensus)
+#plot_umap(umap, entropy_consensus, "entropy", "Entropy on the Consensus Matrix")
+
+# Subsample cells
+cells_subset <- sample(rownames(consensus), 3000)
+
+# Subset consensus
+consensus_subset <- consensus[cells_subset, cells_subset]
+
+# Compute entropy
+entropy_consensus <- calculate_entropy(consensus_subset)
+
+# Subset UMAP
+umap_subset <- umap[cells_subset, ]
+
+# Ensure same order
+entropy_consensus <- entropy_consensus[rownames(umap_subset)]
+
+# Plot
+plot_umap(
+    umap_subset,
+    entropy_consensus,
+    "entropy",
+    "Entropy on the Consensus Matrix")
+```
+
+We can see again that the cells with the highest entropy (and thus most unreliable co-clustering behaviour with other cells) are mostly at the transitioning cells between the two clusters.
+
+
+```{r}
+entropy_membership <- calculate_entropy(fuzzy_clust_analysis$degree_matrices_list[[chosen_config]][,2:3]) # exclude cell name column
+plot_umap(umap, entropy_membership, "entropy", "Entropy on the Membership Matrix")
+
+```
+
+# Pseudotime analysis
+
+We will use the gene based mode of pseudotime analysis passing the following:
+
+- Start and end genes: critical for setting the starting/ending positions of the pseudotime ordering. A biologist typically provides these genes or can be identified using the ClustAssess Shiny app [2].
+- Distribution Threshold: Set the quantile threshold for each gene in the start and end gene sets, where a cell must express the gene above this quantile of its overall expression to be considered for pseudotime analysis. The threshold is calculated individually for each gene in the start and end gene sets.
+- Number of Relax Genes: Specify the maximum number of genes that can fall below their respective quantile thresholds in a cell's expression profile for both the start and end gene sets. This flexibility allows for a certain number of genes to not meet the expression threshold, enabling the inclusion of the cell in the pseudotime analysis if the remaining genes meet their respective thresholds.
+
+```{r pseudotime_analysis}
+cds <- Flufftail::get_pseudotime_trajectory_inference(
+  seurat_object,
+  colnames(seurat_object),
+  VariableFeatures(seurat_object),
+  umap,
+  start_genes = c("SERPINE1", "CYP2B6", "INSIG1", "HMGCS1"),
+  start_relax_ngenes = 1,
+  end_genes = c("CFTR", "RALYL", "KRT7", "ITGB8"),
+  end_relax_ngenes = 1,
+  threshold = 0.8)
+
+plot_cells(
+  cds,
+  color_cells_by = "pseudotime",
+  label_cell_groups = FALSE,
+  label_leaves = FALSE,
+  label_branch_points = FALSE,
+  graph_label_size = 1.5,
+  label_roots = F,
+  cell_size=0.8)
+
+pseudo_df <- data.frame(
+  cell = colnames(cds),
+  pseudotime = pseudotime(cds))
+#write.csv(pseudo_df, "C:/Users/Floarea/Desktop/corebioinfo/codes/flufftail/input_data/shared_pseudotime.csv")
+summary(pseudotime(cds))
+```
+
+
+A useful feature of Flufftail is the ability to get the decomposed pseudotime plot which visualises the distribution of cell types and clusters along the pseudotime axis (derived from the trajectory learned on all cells).
+```{r decomposed_pseudotime, results=hide}
+# Ensure umap is a dataframe and the first two columns are named UMAP_1 and UMAP_2
+umap_df <- as.data.frame(umap)
+colnames(umap_df) <- c("UMAP_1", "UMAP_2")
+
+umap_df$hard_clusters <- unlist(fuzzy_clust_analysis$hard_clusters_list[[chosen_config]])
+umap_df_subsampled <- umap_df[colnames(cds), ]
+pData(cds)$cell_type <- pData(cds)$cell.annotation
+
+decomposed_pseudotime_plot <- get_decomposed_pseudotime_plot(cds, umap_df_subsampled$hard_clusters)
+decomposed_pseudotime_plot$combined
+
+# decomposed_pseudotime_plot$p2 + theme(
+#     legend.title = element_text(size = 18),
+#     legend.text = element_text(size = 15),
+#     axis.title = element_text(size = 18),
+#     axis.text = element_text(size = 18),
+#     axis.text.x =  element_text(size=15)
+#   )
+
+```
+
+
+The cells in cluster 1 display significantly lower pseudotime values and much narrower distribution compared to those in cluster 2. This highlights the sequential transition from cluster 1, representing Hepatocytes, to cluster 2, representing Cholangiocytes, over time.
+
+# Find DE genes at the transition area
+Researchers can identify clusters transitioning from one to another using the decomposed pseudotime plot and then use Flufftail to pinpoint genes differentially expressed specifically during the transition. In our case study, we only have two clusters, making the selection trivial; however, this technique can be applied to scenarios with multiple clusters.
+
+The `get_transition_cells` function calculates the centroids of the two clusters of interest, and allows for a selection of a specific percentage of samples around these centroids. It also identifies the midpoint centroid—positioned between the two cluster centroids—which represents the transition area between clusters. The position of this midpoint centroid can be adjusted using the `x_y_translation` argument, and a defined number of cells surrounding this midpoint can be selected to represent the transitioning cells.
+
+In this example, we select 40% of cells around the centroids of two clusters and 770 cells (purple colour) around the midpoint centroid, which I have shifted in UMAP coordinates by x = -0.8 and y = +1.1. The number of cells selected around the midpoint centroid should be adjusted based on the total number of samples in your dataset.
+
+```{r transition_cells}
+# Get cells at the transition between two clusters of interest and cells around the centroids of the two clusters.
+transition_cells_results <- Flufftail::get_transition_cells(umap_df, clusters_of_interest = c(1,2), percentage_points_centroid = 0.4, x_y_translation = c(-0.8,1.1), num_points_transition = 770)
+transition_cells_results$plot
+```
+
+**Important Note:** Our original analysis was performed in the package’s Shiny app, which enables biologists to interactively deselect cells for refinement. To replicate those results in R Markdown, we load the saved analysis object from the app and exclude the same cells before proceeding.
+
+```{r reproducing_cells_app}
+# Reading the analysis done using the shiny app. This is only to exclude the cells deselected at the bridge.
+# flufftail_analysis_shiny_app <- readRDS("/Users/rafael/Downloads/flufftail_analysis_with_Rafael.rds")
+# cells_excluded_from_shiny_app <- setdiff(
+#   transition_cells_results$cells_at_transition,
+#   flufftail_analysis_shiny_app$de_genes$closest_points_to_midpoint$cell
+# )
+# 
+# # Update the list of transition cells after exclusion
+# transition_cells_results$cells_at_transition <- setdiff(
+#   transition_cells_results$cells_at_transition,
+#   cells_excluded_from_shiny_app
+# )
+```
+
+Now let's plot again the cells around each of the different states along with their centroids. 
+
+```{r}
+# Specify cell state
+umap_df$state <- "other"
+umap_df$state[rownames(umap_df) %in% transition_cells_results$centroids_cells[[1]]] <- "State A"
+umap_df$state[rownames(umap_df) %in% transition_cells_results$centroids_cells[[2]]] <- "State B"
+umap_df$state[rownames(umap_df) %in% transition_cells_results$cells_at_transition] <- "Transition"
+
+default_colors <- scales::hue_pal()(3)
+default_red <- default_colors[1]
+default_blue <- default_colors[3]
+
+plot_with_cell_states <- ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2, color = state)) +
+  geom_point(size = 1) +
+  scale_color_manual(
+    values = c(
+      "other" = "gray80",
+      "State A" = default_red,
+      "State B" = default_blue,
+      "Transition" = "purple"
+    )
+  ) +
+  geom_point(data = transition_cells_results$centroid_results$midpoint_centroid, aes(x = centroid_UMAP_1, y = centroid_UMAP_2), color = "yellow", fill = "black", size = 5, shape = 23, stroke=2) +
+  theme_classic() +
+   geom_point(data = transition_cells_results$centroid_results$centroids, aes(x = centroid_UMAP_1, y = centroid_UMAP_2), color = "yellow", fill="black", size = 5, shape = 23, stroke=2) +
+  labs(color = "Cell state")
+
+plot_with_cell_states
+```
+
+Genes driving the transition are identified by subsetting the trajectory to include only the transitioning cells (colored purple) and using Monocle3’s `graph_test` function. The stringency of gene identification can be adjusted by modifying the q_value_thresh and morans_I_thresh. In this example, I opt for lenient values (q_value < 0.05, morans_I > 0.02) to identify a higher number of genes to be used for gene module clustering (see next section).
+
+```{r de_genes_at_transition, results=hide}
+# Identify DE genes at the area where there are cells of transition.
+DE_genes_results <- Flufftail::identify_DE_genes_at_the_transition(cds, transition_cells_results$cells_at_transition,  q_value_thresh=0.05, morans_I_thresh=0.02)
+
+shared_genes <- intersect(
+  DE_genes_results$test_results$gene_short_name,
+  VariableFeatures(seurat_object)
+)
+#writeLines(shared_genes, "C:/Users/Floarea/Desktop/corebioinfo/codes/flufftail/input_data/shared_genes.txt")
+```
+
+The gene expression of the top DE genes identified (sorted by descending Moran's I test value) across the pseudotime can be visualized in a heatmap.
+
+```{r top_de_genes}
+# Get top 25 DE genes at the transition - ranked by the morans I test.
+top_DE_genes_transition <- DE_genes_results$test_results %>% arrange(desc(morans_I))
+top_DE_genes_transition <- top_DE_genes_transition[1:20,]
+
+# Assign the cell type to the seurat object.
+seurat_object$cell_type <- seurat_object$cell.annotation
+
+plot_top_DE_genes <- plot_DE_genes_heatmap(DE_genes_results$cds_sub, seurat_object@meta.data, top_DE_genes_transition$gene_short_name, 10)
+plot_top_DE_genes
+```
+
+The plot shows the gene expression heatmap of the top 25 DE genes, enabling the identification of genes that are most expressed at different points of the transition.
+
+We can also perform gene set enrichment analysis.
+
+```{r gsea}
+results <- gprofiler2::gost(
+            query = subset(DE_genes_results$full_result)$gene_short_name,
+            source = c("KEGG"),
+            organism = "hsapiens",
+            as_short_link = FALSE,
+            evcodes = TRUE
+          )
+
+gsea_results <- results$result %>% arrange(desc(intersection_size))
+
+head(gsea_results[,1:11])
+
+```
+
+
+Highlight top 5 by intersection size
+```{r}
+
+top5 <- gsea_results %>% 
+  slice(1:5)
+
+p <- ggplot(gsea_results, aes(x = reorder(term_name, -log10(p_value)), 
+                              y = -log10(p_value), 
+                              size = intersection_size)) +
+  geom_point(color = "grey70", alpha = 0.6) +
+  geom_point(data = top5, aes(color = term_name), size = 4) +
+  geom_text_repel(data = top5,
+                  aes(label = term_name),
+                  size = 5,                  # larger text for pathway labels
+                  max.overlaps = Inf,
+                  box.padding = 0.6,
+                  segment.color = "grey60") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text = element_text(size = 14),
+    axis.title = element_text(size = 16)
+  ) +
+  expand_limits(
+    y = max(-log10(gsea_results$p_value)) + 1,
+    x = c(0.5, nrow(gsea_results) + 5)
+  ) +
+  labs(x = "KEGG Pathways", y = "-log10(p-adj)") +
+  guides(color = "none") 
+
+p 
+```
+
+
+We can see that we were able to also identify the PI3K-Akt signaling pathway which as discussed by the paper is strongly associated with obesity and metabolic syndrome—both closely linked to MASLD.
+
+Flufftail has two complementary strategies to study GRN dynamics: **data-driven hub discovery** approach and a **pathway-guided analysis**. 
+
+The data-driven strategy (PATH 1) applies repeated community detection clustering on the transposed matrix of transitioning cells and DE genes (transitioning matrix) to reveal co-expression modules. Genes with low ECC across iterations, termed “fuzzy genes”, exhibit unstable module membership, suggesting flexible regulatory roles. Flufftail then prioritizes the fuzzy genes with strong network influence, nominating major regulatory hubs, such as transcription factors, that are likely to drive transcriptional rewiring. 
+
+The pathway-guided strategy (PATH 2) begins with the gene set enrichment analysis (GSEA); once a pathway is selected, the GRN dynamics of selected genes within the pathway can be examined at the three different stages.
+
+Both strategies converge in the construction of stage-specific GRNs to map regulatory rewiring across source, transition, and destination states.
+
+
+# GRN dynamics - data-driven strategy (PATH 1)
+
+## Fuzzy gene module clustering
+Fuzzy gene module clustering can be performed on the pseudotime DE genes at the transition cells (identified above - transition_cells_results$cells_at_transition). The researcher can choose the resolution sequence (start, step, end), community-detection algorithm (1=Louvain, 2=Louvain-refined, 3=SLM, 4=Leiden), and the number of iterations for the fuzzy gene module clustering. 
+
+Once the clustering finishes, a table reporting the number of partitions and a 5+1 figure ECC summary for each configuration (resolution, /(k/)) can be obtained using `get_summary_each_config_gene_modules`.
+
+We will use SLM with 50 repetitions, trying different resolutions from 0.1 to 1.0 with 0.1 increments.
+
+```{r gene_modules, message=FALSE}
+scaled_matrix <- seurat_object@assays$SCT@scale.data
+
+# Get matrix of cells at the transition and of genes influencing the transition (differentially expressed across the pseudotime at the transition area).
+transition_matrix <- scaled_matrix[DE_genes_results$test_results$gene_short_name, transition_cells_results$cells_at_transition]
+
+# Perform gene module clustering
+gene_modules_clustering <- Flufftail::gene_modules_fuzzy_clustering(transition_matrix, nruns=50, resolution_list = seq(0.1, 1.0, 0.1), algorithm = 3)
+
+# Get summary for each configuration (resolution, k).
+summary_table <- get_summary_each_config_gene_modules(gene_modules_clustering)
+print(summary_table)
+```
+
+We want to select a configuration based on the number of clusters we want that also has some fuzziness (to be able to identify fuzzy genes). For this example I am going to select partitions where resolution=0.5 and /(k/)=4 as it has a lot of stable cells (q75 ecc = 0.9586) but also some fuzziness (median ecc = 0.8517).
+
+Let's check the degree matrix for this configuration.
+
+```{r degree_matrix_gene_modules}
+chosen_resolution_gene_mod <- "0.5"
+chosen_k_gene_mod <- "4"
+head(gene_modules_clustering$degree_matrix_list[[chosen_resolution_gene_mod]][[chosen_k_gene_mod]])
+
+```
+We can also examine the ECC and hard clusters UMAP plots.
+
+```{r umap_gene_modules}
+# Get umap of gene module clustering.
+umap_gene_modules <- gene_modules_clustering$umap
+
+# Get the ecc of a setting of interest.
+ecc_gene_module <- gene_modules_clustering$element_consistency_list[[chosen_resolution_gene_mod]][[chosen_k_gene_mod]]
+plot_umap(umap_gene_modules, ecc_gene_module, "ecc", "ECC gene modules")
+
+# Get the hard clusters of a setting of interest.
+hard_clusters_gene_module <- gene_modules_clustering$hard_clusters_list[[chosen_resolution_gene_mod]][[chosen_k_gene_mod]]
+plot_hard_clusters_gene_modules <- plot_umap(umap_gene_modules, hard_clusters_gene_module, "hard clusters", title = "Hard clusters gene modules")
+plot_hard_clusters_gene_modules
+
+```
+
+The `get_top_fuzzy_ranked` can be used to get top fuzzy genes based on ECC. In this example let's find the top 5% of genes with the lowest ECC.
+
+```{r top_fuzzy_genes}
+# Constuct a dataframe containing the genes and their corresponding ecc.
+gene_modules_ecc_df <- data.frame(gene=rownames(umap_gene_modules), ecc=ecc_gene_module)
+rownames(gene_modules_ecc_df) <- gene_modules_ecc_df$gene
+
+# Get 5% of the most fuzzy genes on this clustering.
+top_fuzzy_genes <- get_top_fuzzy_ranked(gene_modules_ecc_df, "ecc", 0.05)
+top_fuzzy_genes
+```
+
+
+Identifying major regulatory hubs We can construct a GRN using GRNBoost2 [3], testing each top fuzzy gene as a transcription factor (TF). Top fuzzy genes with high co-variation of expression values (termed Importance by GRNBoost2) with many other genes are likely driving the dynamics and are thus potential gene regulatory hubs. To use Flufftail's `get_GRN` function which internally uses GRNBoost2 we need to create a conda environment and install arboreto and pandas. I exported the Conda environment I used (please check the conda_environment folder on the GitHub repo) to a YAML file so that you can easily recreate the virtual environment.
+
+```{r conda_env}
+grnboost2 <- algo$grnboost2
+
+```
+
+
+checks
+
+```{r checks}
+# Find the get_GRN source
+#getAnywhere(get_GRN)
+# or
+#Flufftail:::get_GRN
+
+# # Monkey-patch get_GRN to bypass dask
+# my_get_GRN <- function(exp_matrix, tfs) {
+#   if (length(tfs) == 1) {
+#     tfs <- c(tfs, "")
+#   }
+#   exp_matrix <- t(exp_matrix)
+#   exp_matrix_pd <- pd$DataFrame(
+#     data    = r_to_py(as.matrix(exp_matrix)),
+#     columns = colnames(exp_matrix)
+#   )
+#   tf_names_py <- r_to_py(tfs)
+#   py_seed <- reticulate::py_eval("int(42)")
+#   
+#   # KEY CHANGE: client = NULL bypasses dask entirely
+#   grn_network <- grnboost2(
+#     expression_data = exp_matrix_pd,
+#     tf_names        = tf_names_py,
+#     seed            = py_seed,
+#     client          = NULL
+#   )
+#   
+#   grn_network <- as.data.frame(
+#     lapply(grn_network, function(x) if (is.numeric(x)) round(x, 4) else x)
+#   ) %>% rename(Hub = TF)
+#   
+#   return(grn_network)
+# }
+# 
+# # Override the package function in its own namespace
+# assignInNamespace("get_GRN", my_get_GRN, ns = "Flufftail")
+
+# # Check the patch worked
+# get_GRN
+# # Should show YOUR version, not the original
+# py_run_string("
+# import inspect
+# from arboreto.algo import grnboost2
+# print(inspect.signature(grnboost2))
+# ")
+
+
+
+unlockBinding("get_GRN", as.environment("package:Flufftail"))
+assignInNamespace("get_GRN", my_get_GRN, ns = "Flufftail")
+lockBinding("get_GRN", as.environment("package:Flufftail"))
+
+
+# Run once after reticulate setup
+py_run_string("
+from distributed import Client
+import dask
+dask.config.set({'distributed.worker.daemon': False})
+custom_client = Client(
+  n_workers=1,
+  threads_per_worker=1,
+  processes=False       # single process, no nanny spawning
+)
+")
+
+my_get_GRN <- function(exp_matrix, tfs) {
+  if (length(tfs) == 1) tfs <- c(tfs, "")
+  exp_matrix    <- t(exp_matrix)
+  exp_matrix_pd <- pd$DataFrame(
+    data    = r_to_py(as.matrix(exp_matrix)),
+    columns = colnames(exp_matrix)
+  )
+  tf_names_py <- r_to_py(tfs)
+  py_seed     <- reticulate::py_eval("int(42)")
+  
+  grn_network <- grnboost2(
+    expression_data   = exp_matrix_pd,
+    tf_names          = tf_names_py,
+    seed              = py_seed,
+    client_or_address = py$custom_client  # <-- your stable client
+  )
+  
+  grn_network <- as.data.frame(
+    lapply(grn_network, function(x) if (is.numeric(x)) round(x, 4) else x)
+  ) %>% rename(Hub = TF)
+  return(grn_network)
+}
+
+# Force override
+unlockBinding("get_GRN", as.environment("package:Flufftail"))
+assignInNamespace("get_GRN", my_get_GRN, ns = "Flufftail")
+lockBinding("get_GRN", as.environment("package:Flufftail"))
+
+```
+
+
+
+
+Let's construct the GRN and get the 5+1 figure summary of the Importance across all top fuzzy genes (will refer to this as global Importance).
+
+```{r summary_grn, results=hide}
+py_run_string("
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+")
+
+grn_network_all_top_fuzzy <- get_GRN(transition_matrix, top_fuzzy_genes)
+
+
+```
+
+
+
+```{r summary_grn2}
+
+# Get 5+1 figure summary of global Importance.
+summary(grn_network_all_top_fuzzy$importance)
+
+# Identify global median and third quartile importance.
+global_median_importance <- median(grn_network_all_top_fuzzy$importance)
+global_third_quartile_importance <- quantile(grn_network_all_top_fuzzy$importance, 0.75)
+
+```
+
+
+Now we can use the `get_summary_connections_per_gene_df` function to get for each gene the number of other genes with which it has an Importance value exceeding the global median and third quartile Importance. This highlights the genes most involved in the regulatory dynamics.
+
+```{r connections_genes}
+# Get number of connections per gene
+summary_of_connections_per_gene_df <- Flufftail::get_summary_connections_per_gene_df(grn_network_all_top_fuzzy, top_fuzzy_genes)
+
+# Get top 25 genes sorted by the number of genes above global third quartile of importance.
+combined_ecc_with_summary_connections_df <- merge(gene_modules_ecc_df, summary_of_connections_per_gene_df, by = "gene")
+
+sorted_connections_df_output <- combined_ecc_with_summary_connections_df %>% arrange(desc(percentage_genes_above_target_third_quartile_importance)) %>% select(gene, ecc, percentage_genes_above_target_median_importance, percentage_genes_above_target_third_quartile_importance) %>% head(25)
+
+sorted_connections_df_output
+```
+
+Within the top 25 potential major regulatory hubs we have FGF13 (rank 2), CREB5 (rank 8), KLF6 (rank 20), SERPINE1 (rank 22) all of which were found by Gribben et al. to be upregulated in biphenotypic hepatocyte–cholangiocyte cells, thereby highlighting the potential of Flufftail to recover experimentally confirmed regulators.
+
+We can highlight these genes on the UMAP to check where they are located.
+
+```{r}
+potential_major_regulatory_hubs <- c("KLF6", "SERPINE1", "CREB5", "FGF13")
+
+highlight_df <- data.frame(
+  UMAP_1 = umap_gene_modules[potential_major_regulatory_hubs, 1],
+  UMAP_2 = umap_gene_modules[potential_major_regulatory_hubs, 2],
+  gene   = potential_major_regulatory_hubs
+)
+
+plot_hard_clusters_gene_modules +
+  geom_point(
+    data = highlight_df,
+    aes(UMAP_1, UMAP_2),
+    color = "black",
+    size = 2
+  ) +
+  geom_label_repel(
+    data = highlight_df,
+    aes(UMAP_1, UMAP_2, label = gene),
+    color = "black",
+    fill = "white",         
+    label.size = 0.2,      
+    box.padding = 0.4,     
+    point.padding = 0.3,
+    segment.color = "grey40",
+    size = 8
+  ) + theme_large_text + guides(
+    color = guide_legend(
+      override.aes = list(size = 6)   # make legend circles larger
+    )
+  )
+
+```
+Interestingly CREB5, KLF6, and SERPINE1 are all next to each other. FGF13 is relatively further away but still part of the same gene module cluster (hard cluster 3).
+
+Let's check the expression of these four potential major regulatory hubs across the pseudotime.
+
+```{r major_regulatory_hubs}
+Flufftail::plot_genes_across_pseudotime(cds[potential_major_regulatory_hubs,], genes_to_plot=potential_major_regulatory_hubs) + theme_large_text
+
+```
+
+All four genes expression changes signficantly across the pseudotime. FGF13 expression exhibs a unimodal distribution along pseudotime, rising gradually from low levels in hepatocyte-like cells to a pronounced peak within the transition zone (pseudotime ≈ 5–8) before declining toward the cholangiocyte end state.
+
+## GRN dynamics
+Now let's examine the GRNs, setting them as hub genes at the three different states. We will specify as GRNBoost2 TFs the major regulatory hubs chosen above. The other genes in each of the input matrices are the DE genes identified earlier.
+
+```{r grn_three_centroids, results=hide}
+grns_path1 <- Flufftail::get_three_stage_GRNs(scaled_matrix, genes=DE_genes_results$test_results$gene_short_name, tfs = potential_major_regulatory_hubs, transition_cells_results = transition_cells_results, top_n = 5, importance_thresh=0.85)
+
+```
+
+The resulting GRNs for the three states/locations can be visualized individually at each step and combined, allowing for the examination of changes in regulatory topology and interaction strength. This provides detailed snapshots of GRNs across the transition, unveiling regulatory dynamics and advancing the researcher's understanding of the cellular transitions
+
+
+```{r}
+visualise_GRN(grns_path1$grn_list$grn_centroid_A, tfs= potential_major_regulatory_hubs, top_n = 5, importance_thresh=0.85)$plot
+```
+
+
+```{r}
+visualise_GRN(grns_path1$grn_list$grn_centroid_transition, tfs= potential_major_regulatory_hubs, top_n = 5, importance_thresh=0.85)$plot
+
+```
+
+
+```{r}
+visualise_GRN(grns_path1$grn_list$grn_centroid_B, tfs= potential_major_regulatory_hubs, top_n = 5, importance_thresh=0.85)$plot
+
+```
+
+
+
+We can also create a combined plot which highlights commonalities and differences.
+
+```{r grn_combined_visualisation}
+combined_grn <- create_combined_GRN(grn_1 = grns_path1$grn_plot_list$network_cluster_first, grn_mid = grns_path1$grn_plot_list$network_midpoint, grn_2 = grns_path1$grn_plot_list$network_cluster_second)
+
+combined_grn
+
+```
+
+
+# GRN Dynamics - pathway-guided strategy (PATH 2)
+Besides the data-driven route, Flufftail supports a pathway-guided analysis that starts from biologically curated gene sets and asks how regulatory wiring shifts across source → bridge → destination. 
+
+Here we restrict GRN inference to pathway members present in our data and compare edges across the three stages. This path is a focused lens to expose **context-dependent rewiring** within a validated pathway.
+
+Let's start by getting the genes of the PI3K–AKT pathway that are available in our scaled expression matrix.
+
+```{r pi3k_genes, results=hide}
+# Get all PI3K–AKT pathway genes
+pathway_genes <- gprofiler2::gconvert(
+        query    = "KEGG:04151",       
+        organism = "hsapiens"
+      )$name
+
+
+# Restrict to genes available in our (scaled) expression matrix
+pi3k_genes <- intersect(pathway_genes, rownames(scaled_matrix))
+
+head(pi3k_genes)
+```
+
+Now we can select any gene from this pathway and examine its top interactions with the rest of PI3K–AKT genes that are present in our dataset across the three GRN states.
+
+## Example 1: IGF1-centric view within PI3K–AKT
+For example, let's select the IGF1 gene, which is hepatocyte-enriched yet also supports biliary survival [2–4] and infer the three GRNs (one at each stage).
+
+```{r grn_igf1_example, results=hide}
+grns_path2_igf1 <- Flufftail::get_three_stage_GRNs(scaled_matrix = scaled_matrix, genes = pi3k_genes, tfs = "IGF1", transition_cells_results = transition_cells_results)
+
+# Hepatocyte state
+grns_path2_igf1$grn_plot_list$network_cluster_first$plot
+
+# Bridging population state
+grns_path2_igf1$grn_plot_list$network_midpoint$plot
+
+# Cholangocyte state
+grns_path2_igf1$grn_plot_list$network_cluster_second$plot
+
+```
+
+In the hepatocyte state (Cluster A), IGF1 shows strong inferred regulatory associations with EGFR-axis ligands (AREG, EREG), consistent with activation of regenerative signalling in cholestatic stress [5–7]. IGF1 is also linked with SPP1 (osteopontin), a factor upregulated in NASH that promotes chemokine secretion [8–10], suggesting hepatocyte-derived IGF1 may co-vary with inflammatory cues at the hepatocyte–cholangiocyte boundary. In the bridge state (Midpoint Cluster), IGF1’s strongest associations shift toward IL2RG, MAGI1, and FGF23. There is also a weaker but notable edge to **CREB5**. 
+
+```{r igf1_creb5_expression, results=hide}
+major_regulatory_hubs_of_interest <- c("IGF1", "CREB5")
+pseudo_fuzzy <- cds[major_regulatory_hubs_of_interest,]
+Flufftail::plot_genes_across_pseudotime(pseudo_fuzzy, genes_to_plot=major_regulatory_hubs_of_interest)
+```
+
+Interestingly, when examining their expression across the pseudotime, we can see that IGF1 and CREB5 follow opposite expression trends: IGF1 declines steadily, while CREB5 increases toward the cholangiocyte end of the trajectory. This suggests a potential handover of regulatory influence, where IGF1 is most active early in hepatocyte-like cells and CREB5 becomes more prominent later in transitional states. 
+
+This observation provides a rationale for testing both genes as transcription factor inputs in Flufftail’s pathway-guided GRN analysis, to evaluate whether they function as complementary or opposing regulators across states.
+
+```{r}
+grns_path2_igf1_creb5 <- Flufftail::get_three_stage_GRNs(scaled_matrix = scaled_matrix, genes = pi3k_genes, tfs = "IGF1", transition_cells_results = transition_cells_results)
+
+# Hepatocyte state
+grns_path2_igf1_creb5$grn_plot_list$network_cluster_first$plot
+
+# Bridging population state
+grns_path2_igf1_creb5$grn_plot_list$network_midpoint$plot
+
+# Cholangocyte state
+grns_path2_igf1_creb5$grn_plot_list$network_cluster_second$plot
+```
+
+## Example 2: Multiple genes of interest
+
+Here is an example when selecting multiple genes of interest in the pathway.
+
+```{r grn_igf1_creb5_example, results=hide}
+genes_of_interest_pathway <- c("IGF1", "CREB5", "PIK3R5", "PIK3CD", "BCL2", "COL4A1", "COL4A2")
+
+# TODO: include in powerepoint both 0.85 and 0.9 thresh.
+grns_path2_example <- Flufftail::get_three_stage_GRNs(scaled_matrix = scaled_matrix, genes = pi3k_genes, tfs = genes_of_interest_pathway, transition_cells_results = transition_cells_results, importance_thresh = 0.9, top_n = 10)
+
+```
+```{r}
+visualise_GRN(grns_path2_example$grn_list$grn_centroid_A, tfs= genes_of_interest_pathway, top_n = 10, importance_thresh=0.9)$plot
+
+visualise_GRN(grns_path2_example$grn_list$grn_centroid_transition, tfs= genes_of_interest_pathway, top_n = 10, importance_thresh=0.9)$plot
+
+visualise_GRN(grns_path2_example$grn_list$grn_centroid_B, tfs= genes_of_interest_pathway, top_n = 10, importance_thresh=0.9)$plot
+
+```
+
+
+In the hepatocyte state, BCL2 connects with TNC and NGF, hinting at roles in matrix interaction and growth-factor response. IGF1 shows broad connectivity, linking to EGFR, FGF9, EPO, ITGA4, and EFNA1.
+
+During the transition state, IGF1 loses these hepatocyte-specific links and instead associates with LPAR3, LPAR4, NR4A1, and CSF3R, reflecting a shift toward alternative signaling programs. Its influence contracts further in the cholangiocyte state, where IGF1 is no longer a central regulator.
+
+ITGA4, which partners with IGF1 in the hepatocyte state, becomes strongly associated with BCL2 in the transition state. BCL2 also links to CREB5, a transcription factor that becomes prominent in the cholangiocyte network, where CREB5 connects with genes such as LAMA3, LPAR3, and EREG.
+
+## References:
+[1] Gribben, C., Galanakis, V., Calderwood, A., Williams, E. C., Chazarra-Gil, R., Larraz, M., Frau, C., Puengel, T., Guillot, A., Rouhani, F. J., Mahbubani, K., Godfrey, E., Davies, S. E., Athanasiadis, E., Saeb-Parsy, K., Tacke, F., Allison, M., Mohorianu, I., & Vallier, L. (2024). Acquisition of epithelial plasticity in human chronic liver disease. Nature, 630(8015), 166–173. https://doi.org/10.1038/s41586-024-07465-2
+
+[2] Shahsavari, A., Munteanu, A., & Mohorianu, I. (2022). ClustAssess: tools for assessing the robustness of single-cell clustering. bioRxiv. https://doi.org/10.1101/2022.01.31.478592
+

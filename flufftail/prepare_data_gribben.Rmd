@@ -1,0 +1,147 @@
+---
+title: "prepare data on the Gribben et. al dataset"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+date: "June 2026"
+---
+
+
+```{r message=FALSE, warning=FALSE}
+library(Seurat)
+library(SeuratWrappers)
+library(dplyr)
+#library(gprofiler2)
+library(ggplot2)
+#library(ggrepel)
+library(SeuratDisk)
+#library(anndataR)
+library(org.Hs.eg.db)
+library(scCustomize) # Used for robust, seamless .h5ad export
+set.seed(42)
+
+```
+
+
+Prepare seurat object for Python reading
+Let’s begin by loading a pre-processed Seurat object, which is ready for clustering
+ (the adjacency matrix has already been computed using Seurat’s FindNeighbors) and visualise the cell types/annotations.
+ 
+```{r load_object, cache=FALSE}
+
+# download data from https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE202379
+
+full <- readRDS("C:/Users/Floarea/Desktop/corebioinfo/codes/data_processing/input_data/GSE202379_SeuratObject_AllCells.rds")
+
+# meta <- full@meta.data %>%
+#   mutate(Disease.status = factor(Disease.status, levels = disease_order))
+
+# # Hepatocyte/Cholangiocyte composition within each disease
+
+# meta %>%
+#   filter(cell.annotation %in% c("Hepatocytes", "Cholangiocytes")) %>%
+#   count(Disease.status, cell.annotation) %>%
+#   group_by(Disease.status) %>%
+#   mutate(percent = round(100 * n / sum(n), 2))
+
+# # Disease composition of entire dataset
+
+# meta %>%
+#   count(Disease.status) %>%
+#   mutate(percent = round(100 * n / sum(n), 2))
+
+
+#DefaultAssay(full)
+#dim(full[["RNA"]]) #31257 99809
+#dim(full[["SCT"]]) #30117 99809
+
+# # keep only the cells we're interested in
+cells_keep <- colnames(full)[
+    full$cell.annotation %in% c("Hepatocytes", "Cholangiocytes") &
+    full$Disease.status == "end stage"]
+
+#length(cells_keep) #25527
+seurat_object <- subset(full,cells = cells_keep)
+rm(full)
+
+# # Plot the UMAP reduction to visualize cell annotations
+DimPlot(seurat_object, reduction="umap_harmony_t.0", group.by = "cell.annotation")
+
+```
+
+
+Remove the bottom island to focus on the population with the hepatocyte-cholangocyte bridge.
+
+```{r remove_island}
+# # Remove bottom island - all below -6 on UMAP_2
+umap_df <- as.data.frame(seurat_object@reductions$umap_harmony_t.0@cell.embeddings)
+colnames(umap_df) <- c("UMAP_1", "UMAP_2")
+cell_names_keep <- rownames(umap_df[umap_df$UMAP_1 > 4 & umap_df$UMAP_2 > -10, ])
+seurat_object <- subset(seurat_object, cells = cell_names_keep)
+DimPlot(seurat_object, reduction="umap_harmony_t.0", group.by = "cell.annotation")
+
+# # FIX: Strip corrupted SCTModel slots - This is required to bypass the 'containsOutOfMemoryData' error
+# if ("SCT" %in% names(seurat_object@assays)) {
+#     message("Cleaning SCTModel slots to prevent saving errors...")
+#     seurat_object[["SCT"]]@SCTModel.list <- list()
+# }
+# 
+# # Define save path
+# input_dir <- "C:/Users/Floarea/Desktop/corebioinfo/codes/data_processing/input_data"
+# rds_output <- file.path(input_dir, "hep_chol_endstate_truncated.rds")
+# 
+# # Save the object
+# message("Saving object to: ", rds_output)
+# saveRDS(seurat_object, file = rds_output, compress = TRUE)
+```
+
+
+
+```{r keep only protein coding genes}
+
+# # Load the Master Seurat Object ──────────────────────────────────────────
+# input_dir   <- "C:/Users/Floarea/Desktop/corebioinfo/codes/data_processing/input_data"
+# seurat_path <- file.path(input_dir, "hep_chol_endstate_truncated.rds")
+# seurat_object <- readRDS(seurat_path)
+
+#seurat_object <- readRDS(seurat_path)
+print(paste("Original Dataset:", nrow(seurat_object), "genes ×", ncol(seurat_object), "cells"))
+
+# Identify Protein-Coding Genes ──────────────────────────────────────────
+all_genes <- rownames(seurat_object)
+
+# Query the database for gene types
+gene_mapping <- select(org.Hs.eg.db,
+                       keys = all_genes,
+                       columns = c("SYMBOL", "GENETYPE"),
+                       keytype = "SYMBOL")
+
+# Extract only genes explicitly flagged as "protein-coding"
+protein_coding_genes <- gene_mapping$SYMBOL[gene_mapping$GENETYPE == "protein-coding"]
+protein_coding_genes <- protein_coding_genes[!is.na(protein_coding_genes)]
+
+# Filter the Seurat Object ───────────────────────────────────────────────
+full_protein_coding <- subset(seurat_object, features = protein_coding_genes)
+print(paste("Filtered Dataset:", nrow(full_protein_coding), "genes ×", ncol(full_protein_coding), "cells"))
+
+# # OUTPUT 1: Save as R Data Structure (.rds) ──────────────────────────────
+# rds_output <- file.path(input_dir, "hep_chol_endstate_truncated_protein_coding.rds")
+# saveRDS(full_protein_coding, file = rds_output)
+# print(paste("📂 [1/2] R-ready file saved to:", rds_output))
+
+# # OUTPUT 2: Save as Python Data Structure (.h5ad) ────────────────────────
+# scCustomize handles the conversion of internal metadata (obs) and counts (X)
+# smoothly without breaking sparse matrix indexing.
+print("Converting and writing .h5ad file for Python...")
+as.anndata(
+  x = full_protein_coding,
+  file_path = input_dir,
+  file_name = "hep_chol_endstate_truncated_protein_coding.h5ad",
+  assay = "RNA" # Speeds up export by saving your standard raw/log count matrices
+)
+
+
+
+```
+
