@@ -1,9 +1,0 @@
-#!/usr/bin/env python
-
-import velorama
-
-velorama.execute_cmdline()
-
-
-
-
