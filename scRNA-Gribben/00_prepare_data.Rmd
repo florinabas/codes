@@ -1,0 +1,152 @@
+---
+title: "00 — prepare data (Gribben et al., GSE202379)"
+output:
+  html_document: default
+date: "June 2026"
+---
+
+```{r}
+## 00_prepare_data.R
+## Build the analysis dataset from the raw GSE202379 Seurat object.
+## Output: hep+cholangiocyte end-stage, protein-coding subset, saved as .rds (R side)
+## and .h5ad (Python side, carries the Harmony UMAP used later by step 06).
+
+suppressPackageStartupMessages({
+  library(Seurat); library(dplyr); library(ggplot2); library(org.Hs.eg.db)
+  library(scCustomize)          # robust Seurat -> .h5ad export
+})
+source("gribben_config.R")       # RAW_RDS, INPUT_DIR, PREPARED_RDS/H5AD
+set.seed(42)
+```
+
+
+### STEP 1: load the raw object and look at what we're starting from
+
+
+```{r fig.width=8, fig.height=5}
+full <- readRDS(RAW_RDS) 
+
+
+DefaultAssay(full) <- "RNA"          # switch away from SCT before removing it
+
+if ("SCT" %in% Assays(full)) {
+  full[["SCT"]] <- NULL
+  cat("Dropped SCT assay (SeuratObject version-mismatch workaround); using RNA only.\n")
+}
+
+# GSE202379 all cells (pre-clustered, Harmony embedded)
+cat(sprintf("Raw object: %d genes x %d cells\n", nrow(full), ncol(full)))
+
+# whole-dataset UMAP, coloured by cell type -- the starting point before any filtering
+DimPlot(full, reduction = "umap_harmony_t.0", group.by = "cell.annotation",
+        raster = FALSE) +
+  ggtitle(sprintf("Raw object (all cells, all disease stages): %d cells", ncol(full)))
+
+# composition table: how many cells of each type, at each disease stage
+table(full$cell.annotation, full$Disease.status)
+```
+
+
+### STEP 2: subset to end-stage hepatocytes + cholangiocytes
+
+
+```{r fig.width=8, fig.height=5}
+keep <- colnames(full)[
+  full$cell.annotation %in% c("Hepatocytes", "Cholangiocytes") &
+  full$Disease.status == "end stage"]
+so <- subset(full, cells = keep)
+cat(sprintf("Kept %d / %d cells (%.1f%%)\n", ncol(so), ncol(full), 100 * ncol(so) / ncol(full)))
+rm(full)
+
+DimPlot(so, reduction = "umap_harmony_t.0", group.by = "cell.annotation", raster = FALSE) +
+  ggtitle(sprintf("End-stage Hepatocytes + Cholangiocytes only: %d cells", ncol(so)))
+```
+
+
+### STEP 3: drop the disconnected UMAP island, keep the hep<->chol bridge
+
+
+```{r fig.width=8, fig.height=5}
+## The lower-left island on the Harmony UMAP is a separate population; removing it
+## isolates the transdifferentiation trajectory we want to model.
+umap <- as.data.frame(so@reductions$umap_harmony_t.0@cell.embeddings)
+colnames(umap) <- c("UMAP_1", "UMAP_2")
+umap$cell.annotation <- so$cell.annotation
+umap$kept <- umap$UMAP_1 > 4 & umap$UMAP_2 > -10
+
+# show exactly which cells the cutoff keeps vs discards, before applying it
+ggplot(umap, aes(UMAP_1, UMAP_2, color = kept)) +
+  geom_point(size = 0.6, alpha = 0.6) +
+  scale_color_manual(values = c("TRUE" = "#3576b0", "FALSE" = "grey70")) +
+  geom_vline(xintercept = 4, linetype = "dashed") +
+  geom_hline(yintercept = -10, linetype = "dashed") +
+  ggtitle("Island-removal cutoff (dashed lines): blue = kept") + theme_minimal()
+
+so <- subset(so, cells = rownames(umap[umap$kept, ]))
+cat(sprintf("Kept %d / %d cells after island removal\n", ncol(so), nrow(umap)))
+
+DimPlot(so, reduction = "umap_harmony_t.0", group.by = "cell.annotation", raster = FALSE) +
+  ggtitle(sprintf("After island removal: %d cells", ncol(so)))
+```
+
+
+### STEP 4: restrict to protein-coding genes
+
+
+```{r fig.width=6, fig.height=4}
+## GRN inference is over TFs and coding targets; non-coding features add noise.
+n_genes_before <- nrow(so)
+gt <- select(org.Hs.eg.db, keys = rownames(so),
+             columns = c("SYMBOL", "GENETYPE"), keytype = "SYMBOL")
+pc <- na.omit(gt$SYMBOL[gt$GENETYPE == "protein-coding"])
+so <- subset(so, features = pc)
+cat(sprintf("Prepared: %d genes x %d cells\n", nrow(so), ncol(so)))
+
+gene_counts <- data.frame(stage = c("before (all genes)", "after (protein-coding)"),
+                          n_genes = c(n_genes_before, nrow(so)))
+ggplot(gene_counts, aes(stage, n_genes)) +
+  geom_col(fill = "#3576b0", width = 0.5) +
+  geom_text(aes(label = n_genes), vjust = -0.4) +
+  ggtitle("Gene count before/after protein-coding filter") +
+  ylab("# genes") + xlab(NULL) + theme_minimal()
+```
+
+
+### STEP 5: write both artifacts
+
+
+```{r fig.width=8, fig.height=5}
+
+
+if ("SCT" %in% Assays(so)) {
+  DefaultAssay(so) <- "RNA"
+  so[["SCT"]] <- NULL
+}
+
+saveRDS(so, PREPARED_RDS)                                  # -> 01, 02, 03
+
+library(reticulate)
+
+# point reticulate at your env if it's not the default one, e.g.:
+# reticulate::use_condaenv("your_env_name", required = TRUE)
+
+if (!reticulate::py_module_available("anndata")) {
+  reticulate::py_install("anndata", pip = TRUE)
+}
+as.anndata(x = so, file_path = INPUT_DIR,                  # -> 04 (build) and 06 (Harmony)
+           file_name = basename(PREPARED_H5AD), assay = "RNA")
+cat("Wrote:\n  ", PREPARED_RDS, "\n  ", PREPARED_H5AD, "\n")
+
+# final snapshot of the prepared dataset that every downstream step consumes
+DimPlot(so, reduction = "umap_harmony_t.0", group.by = "cell.annotation", raster = FALSE) +
+  ggtitle(sprintf("PREPARED dataset (final): %d genes x %d cells", nrow(so), ncol(so)))
+knitr::kable(as.data.frame(table(so$cell.annotation)),
+            col.names = c("cell type", "n cells"), caption = "Final composition")
+```
+
+
+## Next steps / gaps
+
+
+- No extra QC here (raw object is already filtered upstream). If you re-derive from truly raw counts, add nFeature/percent.mt filtering before STEP 1, with a violin plot of QC metrics before/after.
+- Harmony embeddings come from the source object; they are trusted as-is. If you ever re-integrate, re-run Harmony before export so step 06's UMAP stays valid.

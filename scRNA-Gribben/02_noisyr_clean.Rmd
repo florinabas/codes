@@ -1,0 +1,117 @@
+---
+title: "02 — noisyR: expression-noise threshold"
+output:
+  html_document: default
+date: "June 2026"
+---
+
+```{r}
+## 02_noisyr_clean.R
+## Estimate an expression-noise threshold (noisyR) and emit the list of "signal"
+## genes that sit above it. Consumed by step 05 to test whether noise removal
+## improves Velorama seed stability.
+
+suppressPackageStartupMessages({ library(Seurat); library(noisyr); library(Matrix); library(ggplot2) })
+source("gribben_config.R")        # PREPARED_RDS, INTERM_DIR
+set.seed(42)
+```
+
+
+### STEP 1: load counts + annotations
+
+
+```{r}
+so     <- readRDS(PREPARED_RDS)
+counts <- GetAssayData(so, assay = "RNA", layer = "counts")   # genes x cells, sparse
+ann    <- as.character(so$cell.annotation)
+```
+
+
+### STEP 2: pseudo-bulk into K replicates per cell type
+
+
+```{r}
+## noisyR's count approach expects a handful of samples; single cells are too sparse,
+## so we average random cell groups within each annotation into pseudo-samples.
+K <- 5L
+groups <- function(idx, k) split(idx, sample(rep(seq_len(k), length.out = length(idx))))
+cols <- list(); nm <- character(0)
+for (ct in unique(ann)) {
+  g <- groups(which(ann == ct), K)
+  for (i in seq_along(g)) {
+    cols[[length(cols) + 1L]] <- Matrix::rowMeans(counts[, g[[i]], drop = FALSE])
+    nm <- c(nm, paste0(ct, "_rep", i))
+  }
+}
+pb <- as.matrix(do.call(cbind, cols)); colnames(pb) <- nm
+pb <- pb[rowSums(pb) > 0, , drop = FALSE]
+```
+
+```{r fig.width=6, fig.height=4}
+cat(sprintf("Pseudobulk matrix: %d genes x %d pseudo-samples\n", nrow(pb), ncol(pb)))
+knitr::kable(data.frame(pseudosample = colnames(pb),
+                        total_expr = round(colSums(pb), 1)),
+            caption = "Pseudo-sample library sizes")
+```
+
+
+### STEP 3: noise threshold from expression-similarity
+
+
+```{r}
+## Genes whose expression tracks the similarity structure are "signal"; the
+## boxplot-IQR rule on the per-sample thresholds gives one global cutoff.
+sim <- calculate_expression_similarity_counts(
+  expression.matrix = pb, similarity.measure = "correlation_pearson",
+  n.elements.per.window = NULL)
+thr        <- as.numeric(calculate_noise_threshold(
+  sim, similarity.threshold = 0.25, method.chosen = "Boxplot-IQR"))
+global_thr <- stats::median(thr, na.rm = TRUE)
+cat(sprintf("Global noise threshold (median of %d samples): %.5f\n", length(thr), global_thr))
+```
+
+```{r fig.width=7, fig.height=4}
+ggplot(data.frame(sample = colnames(pb), thr = thr), aes(sample, thr)) +
+  geom_col(fill = "#9aa0a6") +
+  geom_hline(yintercept = global_thr, color = "#DC143C", linetype = "dashed") +
+  ggtitle(sprintf("Per-sample noise thresholds (dashed = global median %.4f)", global_thr)) +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+### STEP 4: split signal vs noise, write lists
+
+
+```{r}
+gmax    <- apply(pb, 1, max)
+signal  <- rownames(pb)[gmax >  global_thr]
+removed <- union(rownames(pb)[gmax <= global_thr],
+                 setdiff(rownames(counts), rownames(pb)))   # + never-expressed
+cat(sprintf("Signal genes: %d | removed: %d\n", length(signal), length(removed)))
+
+writeLines(signal,  file.path(INTERM_DIR, "noisyr_signal_genes.txt"))   # -> step 05
+writeLines(removed, file.path(INTERM_DIR, "noisyr_removed_genes.txt"))
+writeLines(format(global_thr, digits = 8), file.path(INTERM_DIR, "noisyr_threshold.txt"))
+```
+
+```{r fig.width=8, fig.height=4}
+# where genes fall relative to the threshold, and the resulting signal/noise split
+ggplot(data.frame(gene_max = gmax), aes(gene_max)) +
+  geom_histogram(bins = 80, fill = "#3576b0", alpha = 0.8) +
+  geom_vline(xintercept = global_thr, color = "#DC143C", linetype = "dashed") +
+  scale_x_log10() +
+  ggtitle("Gene max-expression distribution (dashed = noise threshold)") + theme_minimal()
+
+ggplot(data.frame(status = c("signal", "removed"), n = c(length(signal), length(removed))),
+      aes(status, n, fill = status)) +
+  geom_col(width = 0.5) + geom_text(aes(label = n), vjust = -0.4) +
+  scale_fill_manual(values = c(signal = "#3576b0", removed = "grey60")) +
+  ggtitle("Signal vs. removed genes") + theme_minimal() + theme(legend.position = "none")
+```
+
+
+## Next steps / gaps
+
+
+- Pseudo-bulking is a pragmatic adaptation of noisyR (built for bulk RNA-seq) to single cell. K=5 replicates per type is minimal; more replicates = steadier threshold.
+- In this project noisyR did not improve Velorama stability (see step 05, section E), so the signal list is diagnostic rather than a hard filter on the main GRN.

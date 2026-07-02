@@ -1,0 +1,136 @@
+---
+title: "01 — ClustAssess: choose HVG count"
+output:
+  html_document: default
+date: "June 2026"
+---
+
+```{r}
+## 01_clustassess_hvg.R
+## Decide how many highly-variable genes (HVGs) to feed Velorama, by testing which
+## feature-set size gives the most reproducible clustering (ClustAssess feature
+## stability). Emits a single integer to HVG_FILE, consumed by step 04.
+
+suppressPackageStartupMessages({
+  library(Seurat); library(ClustAssess); library(Matrix); library(patchwork); library(ggplot2)
+})
+source("gribben_config.R")        # PREPARED_RDS, HVG_FILE
+seurat_obj <- readRDS(PREPARED_RDS)
+DefaultAssay(seurat_obj) <- "RNA"
+
+library(doParallel)
+n_cores <- max(1, parallel::detectCores() - 1)
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+```
+
+
+### STEP 1: ensure log-normalised data exists
+
+
+```{r}
+if (IsMatrixEmpty(GetAssayData(seurat_obj, assay = "RNA", layer = "data")))
+  seurat_obj <- NormalizeData(seurat_obj, normalization.method = "LogNormalize",
+                              scale.factor = 1e4)
+```
+
+
+### STEP 2: candidate feature-set sizes + the two feature rankings to compare
+
+
+```{r}
+hvg_steps   <- c(500, 1000, 1500, 2000, 3000)   # sizes to score
+resolutions <- seq(0.1, 1.0, by = 0.1)
+n_reps      <- 20                                # raise to 50-100 for a final figure
+max_step    <- max(hvg_steps)
+
+if (length(grep("^counts|^data", Layers(seurat_obj, assay = "RNA"))) > 2)
+  seurat_obj <- JoinLayers(seurat_obj, assay = "RNA")
+
+# HV = highly-variable (vst); MA = most-abundant. ClustAssess compares both.
+seurat_obj <- FindVariableFeatures(seurat_obj, assay = "RNA",
+                                   selection.method = "vst", nfeatures = max_step,
+                                   verbose = FALSE)
+var_features <- VariableFeatures(seurat_obj)
+raw_counts   <- GetAssayData(seurat_obj, assay = "RNA", layer = "counts")
+most_abundant <- rownames(raw_counts)[order(Matrix::rowSums(raw_counts),
+                                            decreasing = TRUE)][seq_len(max_step)]
+```
+
+```{r fig.width=8, fig.height=5}
+# mean-variance relationship, with the top HV genes to be used for stability scoring
+LabelPoints(plot = VariableFeaturePlot(seurat_obj),
+           points = head(var_features, 15), repel = TRUE, xnudge = 0, ynudge = 0) +
+  ggtitle(sprintf("Highly-variable genes (top %d kept for scoring)", max_step))
+
+cat(sprintf("HV/MA overlap: %d genes in common out of %d each\n",
+           length(intersect(var_features, most_abundant)), max_step))
+```
+
+
+### STEP 3: scale the union of both feature sets
+
+
+```{r}
+seurat_obj <- ScaleData(seurat_obj, assay = "RNA",
+                        features = union(var_features, most_abundant), verbose = FALSE)
+scale_mat <- GetAssayData(seurat_obj, assay = "RNA", layer = "scale.data")
+# (dimnames occasionally drop out of scale.data; restore if needed before scoring)
+```
+
+
+### STEP 4: feature-stability assessment (HV and MA), then combine
+
+
+```{r}
+common <- list(steps = hvg_steps, resolution = resolutions, n_repetitions = n_reps,
+               graph_reduction_type = "PCA", ecs_thresh = 1, clustering_algorithm = 1,
+               umap_arguments = list(min_dist = 0.3, n_neighbors = 30, metric = "cosine"))
+
+
+hv <- do.call(assess_feature_stability,
+              c(list(data_matrix = scale_mat, feature_set = var_features,  feature_type = "HV"), common))
+ma <- do.call(assess_feature_stability,
+              c(list(data_matrix = scale_mat, feature_set = most_abundant, feature_type = "MA"), common))
+feature_stability <- mapply(c, hv, ma, SIMPLIFY = FALSE)
+
+stopCluster(cl)
+registerDoSEQ()
+
+
+# Inspect these plots to pick the elbow (stability plateaus vs feature count):
+plot_feature_overall_stability_boxplot(feature_stability, text_size = 2.5)
+plot_feature_overall_stability_incremental(feature_stability, text_size = 2)
+```
+
+
+### STEP 5: record the decision -> HVG_FILE (read by step 04)
+
+
+```{r}
+chosen_n <- 1500L                 # <-- set from the stability elbow above
+writeLines(as.character(chosen_n), HVG_FILE)
+message("Wrote chosen HVG count (", chosen_n, ") to ", HVG_FILE)
+```
+
+```{r fig.width=8, fig.height=5}
+# confirm the chosen feature set actually separates the two cell types before
+# handing N_TOP_HVGS off to step 04
+final_features <- head(var_features, chosen_n)
+seurat_obj <- RunPCA(seurat_obj, features = final_features, npcs = 20, verbose = FALSE)
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:20, verbose = FALSE)
+DimPlot(seurat_obj, reduction = "umap", group.by = "cell.annotation") +
+  ggtitle(sprintf("UMAP on chosen %d HVGs (decision check)", chosen_n))
+
+knitr::kable(data.frame(metric = c("feature type", "chosen n", "HV/MA overlap at max_step"),
+                        value = c("HV (vst)", chosen_n,
+                                 length(intersect(var_features, most_abundant)))))
+```
+
+
+## Next steps / gaps
+
+
+- chosen_n is hand-set from the plots; there is no automatic elbow-picker. If you want it reproducible, add a rule (e.g. smallest step within 1% of peak stability).
+- n_repetitions = 20 is exploratory; bump before quoting stability in the thesis.
